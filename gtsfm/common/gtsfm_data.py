@@ -922,11 +922,6 @@ class GtsfmData:
                 if camera_i is None:
                     continue
                 filtered_data.add_camera(i, camera_i)
-                logger.info(
-                    "Re-added camera %d due to keep_all_cameras_in_merging=True. filtered_data now has %d cameras.",
-                    i,
-                    len(filtered_data.get_valid_camera_indices()),
-                )
 
         return filtered_data
 
