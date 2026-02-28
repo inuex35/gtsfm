@@ -38,7 +38,7 @@ class TestPartitionUtils(unittest.TestCase):
         self.assertEqual(adjacency[2], {1})
 
     def test_build_edges_for_keyset(self) -> None:
-        graph = [(0, 1), (1, 2), (2, 3)]
+        graph = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
         edges = build_edges_for_keyset({0, 1, 2, 3}, graph)
         self.assertEqual(edges, [(0, 1), (1, 2), (2, 3)])
 
