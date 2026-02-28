@@ -44,14 +44,16 @@ def graph_adjacency(graph: VisibilityGraph) -> dict[int, set[int]]:
 
 
 def build_edges_for_keyset(keys: set[int], graph: VisibilityGraph) -> list[tuple[int, int]]:
-    """Build a compact edge set to realize a target set of local keys."""
+    """Build a compact edge set using only visibility edges between the given keys."""
     if len(keys) < 2:
         return []
-    sorted_keys = sorted(keys)
-    graph_edges = {canonical_edge(i, j) for i, j in graph}
-    edges: list[tuple[int, int]] = []
-    for idx in range(len(sorted_keys) - 1):
-        a, b = sorted_keys[idx], sorted_keys[idx + 1]
-        edge = canonical_edge(a, b)
-        edges.append(edge if edge in graph_edges else edge)
-    return sorted(set(edges))
+
+    keyset = set(keys)
+    induced_edges: set[tuple[int, int]] = set()
+
+    # Only keep edges from the visibility graph whose endpoints are both in the key set.
+    for i, j in graph:
+        if i in keyset and j in keyset:
+            induced_edges.add(canonical_edge(i, j))
+
+    return sorted(induced_edges)
