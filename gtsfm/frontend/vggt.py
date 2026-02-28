@@ -19,8 +19,7 @@ from PIL import Image as PILImage
 from torch.amp import autocast as amp_autocast  # type: ignore
 from torchvision import transforms as TF
 
-from gtsfm.bundle.bundle_adjustment import (BundleAdjustmentOptimizer,
-                                            RobustBAMode)
+from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptimizer, RobustBAMode
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.utils import data_utils
 from gtsfm.utils import logger as logger_utils
@@ -107,11 +106,9 @@ if _USING_FASTVGGT:
     logger.info("⚡ FastVGGT enabled via thirdparty/FastVGGT.")
 else:
     logger.info("📷 Using vanilla VGGT (FastVGGT submodule not detected).")
-from vggt.utils.geometry import \
-    unproject_depth_map_to_point_map  # type: ignore
+from vggt.utils.geometry import unproject_depth_map_to_point_map  # type: ignore
 from vggt.utils.helper import randomly_limit_trues  # type: ignore
-from vggt.utils.load_fn import \
-    load_and_preprocess_images_square  # type: ignore
+from vggt.utils.load_fn import load_and_preprocess_images_square  # type: ignore
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri  # type: ignore
 
 DEFAULT_FIXED_RESOLUTION = 518
@@ -339,6 +336,7 @@ class VggtConfiguration:
     ba_use_shared_calibration: bool = True
     use_gnc: bool = False
     gnc_loss: str = "GMC"
+    factor_weight_outlier_threshold: float = 1e-8
 
 
 @dataclass
@@ -419,8 +417,7 @@ class VggtReconstruction:
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(parents=True, exist_ok=True)
 
-        from vggt.utils.visual_track import \
-            visualize_tracks_on_images  # deferred import
+        from vggt.utils.visual_track import visualize_tracks_on_images  # deferred import
 
         visualize_tracks_on_images(
             images=images,
@@ -776,8 +773,7 @@ def _import_vggsfm_utils():
     """Return the vendored vggsfm utilities module from the VGGT submodule."""
 
     try:
-        from vggt.dependency import \
-            vggsfm_utils as _vggsfm_utils  # type: ignore
+        from vggt.dependency import vggsfm_utils as _vggsfm_utils  # type: ignore
     except ImportError as exc:  # pragma: no cover - exercised only when the submodule is absent
         if _USING_FASTVGGT:
             try:
@@ -1149,11 +1145,6 @@ __all__ = [
     "resolve_weights_path",
     "load_model",
     "run_VGGT",
-    "run_reconstruction",
-    "run_vggt_tracking",
-    "VGGTTrackingResult",
-    "VggtOutput",
-]
     "run_reconstruction",
     "run_vggt_tracking",
     "VGGTTrackingResult",

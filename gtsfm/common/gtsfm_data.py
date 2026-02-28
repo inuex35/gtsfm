@@ -14,6 +14,7 @@ import gtsam  # type: ignore
 import numpy as np
 from gtsam import Pose3, SfmTrack, Similarity3, Values
 from gtsam.symbol_shorthand import K, P, X  # type: ignore
+from numpy.typing import NDArray
 
 import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.graph as graph_utils
@@ -904,7 +905,6 @@ class GtsfmData:
                 track_cameras.add(i)
             if len(track_cameras) < min_track_length:
                 continue
-            filtered_data.add_track(new_track)
             for i in track_cameras:
                 camera_i = self.get_camera(i)
                 assert camera_i is not None
@@ -921,33 +921,6 @@ class GtsfmData:
                 camera_i = self.get_camera(i)
                 if camera_i is None:
                     continue
-                filtered_data.add_camera(i, camera_i)
-
-        return filtered_data
-
-    def filter_tracks_by_id(self, track_ids: list[int]) -> "GtsfmData":
-        """Filters out landmarks based on track ids.
-
-        Args:
-            track_ids: list of track ids to remove.
-
-        Returns:
-            New instance without the tracks with the specified ids.
-        """
-        filtered_data = GtsfmData(self.number_images(), gaussian_splats=self._gaussian_splats)
-        filtered_data._image_info = self._clone_image_info()
-
-        for idxtrack, track in enumerate(self._tracks):
-            if idxtrack in track_ids:
-                continue
-            filtered_data.add_track(track)
-            track_cameras = set()
-            for k in range(track.numberMeasurements()):
-                i, _ = track.measurement(k)
-                track_cameras.add(i)
-            for i in track_cameras:
-                camera_i = self.get_camera(i)
-                assert camera_i is not None
                 filtered_data.add_camera(i, camera_i)
 
         return filtered_data
