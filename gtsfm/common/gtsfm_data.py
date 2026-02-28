@@ -875,7 +875,7 @@ class GtsfmData:
         return filtered_data, valid_mask
 
     def filter_landmark_measurements(
-        self, reproj_err_thresh: float = 5, min_track_length: int = 2, keep_all_cameras_in_merging: bool = True
+        self, reproj_err_thresh: float = 5, min_track_length: int = 2, retain_cameras_without_tracks: bool = True
     ) -> "GtsfmData":
         """Filters out landmarks with high reprojection error
 
@@ -913,7 +913,7 @@ class GtsfmData:
             "Filtered_data now has %d cameras after adding cameres from tracks",
             len(filtered_data.get_valid_camera_indices()),
         )
-        if keep_all_cameras_in_merging:
+        if retain_cameras_without_tracks:
             # Reinsert any cameras that were dropped only because all their measurements were filtered out.
             missing_cameras = set(self.cameras().keys()) - set(filtered_data.cameras().keys())
             logger.info("Cameras without tracks: count=%d, ids=%s", len(missing_cameras), sorted(missing_cameras))
