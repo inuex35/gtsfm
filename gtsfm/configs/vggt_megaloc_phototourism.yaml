@@ -18,11 +18,14 @@ image_pairs_generator:
   retriever:
     _target_: gtsfm.retriever.Similarity
     num_matched: 15
-    min_score: 0.4
+    min_score: 0.5
   batch_size: 16
 
 graph_partitioner:
   _target_: gtsfm.graph_partitioner.Metis
+  min_cameras_to_partition: 12
+  max_cameras: 40
+  split_oversized_nodes: true
 
 cluster_optimizer:
   _target_: gtsfm.cluster_optimizer.Cacher
@@ -38,8 +41,10 @@ cluster_optimizer:
     keypoint_extractor: aliked+sp+sift
     track_vis_thresh: 0.05
     track_conf_thresh: 0.2
-    max_reproj_error: 14.0
+    vggt_max_reproj_error: 14.0
+    post_ba_max_reproj_error: 3.0
     min_triangulation_angle: 10.0
+    min_track_length: 2
     camera_type: PINHOLE
     drop_outlier_after_camera_merging: true
     drop_child_if_merging_fail: true
@@ -56,6 +61,10 @@ cluster_optimizer:
     ba_use_undistorted_camera_model: false
     use_shared_calibration: false
     use_gnc: true
-    gnc_loss: GMC
+    gnc_loss: TLS
 
 use_nonlinear_sim3_merging: true
+merging_pre_ba_max_reproj_error: 14.0
+merging_pre_ba_min_track_length: 2
+merging_ba_use_calibration_prior: false
+merging_use_gnc: false
