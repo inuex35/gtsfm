@@ -24,7 +24,9 @@ import gtsfm.utils.logger as logger_utils
 from gtsfm.common.image import Image
 from gtsfm.common.keypoints import Keypoints
 from gtsfm.frontend.detector_descriptor.sift import SIFTDetectorDescriptor
+from gtsfm.frontend.detector_descriptor.aliked import AlikedDetectorDescriptor
 from gtsfm.frontend.matcher.twoway_matcher import TwoWayMatcher
+from gtsfm.frontend.matcher.lightglue_matcher import LightGlueMatcher
 from gtsfm.frontend.verifier.spherical_verifier import SphericalVerifier
 from gtsfm.loader.equirectangular_loader import EquirectangularLoader
 from gtsfm.utils.equirectangular import (
@@ -45,18 +47,23 @@ logger = logger_utils.get_logger()
 def detect_and_describe_all(
     loader: EquirectangularLoader,
     max_keypoints: int = 5000,
+    feature_type: str = "aliked",
 ) -> Tuple[List[Keypoints], List[np.ndarray]]:
-    """Run SIFT detection and description on all images.
+    """Run feature detection and description on all images.
 
     Args:
         loader: Equirectangular image loader.
         max_keypoints: Maximum number of keypoints per image.
+        feature_type: Feature detector/descriptor to use ("sift" or "aliked").
 
     Returns:
         keypoints_list: List of Keypoints per image.
         descriptors_list: List of descriptor arrays per image.
     """
-    detector = SIFTDetectorDescriptor(max_keypoints=max_keypoints)
+    if feature_type == "aliked":
+        detector = AlikedDetectorDescriptor(max_keypoints=max_keypoints)
+    else:
+        detector = SIFTDetectorDescriptor(max_keypoints=max_keypoints)
     keypoints_list = []
     descriptors_list = []
 
@@ -79,6 +86,8 @@ def match_pairs(
     max_frame_lookahead: int = 20,
     ratio_test_threshold: float = 0.8,
     loop_closure: bool = True,
+    matcher_type: str = "lightglue",
+    feature_type: str = "aliked",
 ) -> Dict[Tuple[int, int], np.ndarray]:
     """Match features between image pairs.
 
@@ -90,11 +99,16 @@ def match_pairs(
         ratio_test_threshold: Lowe's ratio test threshold.
         loop_closure: If True, also generate pairs that wrap around the
             sequence (e.g. last frame to first frame) for circular trajectories.
+        matcher_type: Matcher to use ("twoway" or "lightglue").
+        feature_type: Feature type for LightGlue ("aliked", "superpoint", "disk").
 
     Returns:
         Dictionary mapping (i1, i2) to match indices of shape (N, 2).
     """
-    matcher = TwoWayMatcher(ratio_test_threshold=ratio_test_threshold)
+    if matcher_type == "lightglue":
+        matcher = LightGlueMatcher(features=feature_type)
+    else:
+        matcher = TwoWayMatcher(ratio_test_threshold=ratio_test_threshold)
     matches_dict = {}
     num_images = len(keypoints_list)
 
@@ -296,40 +310,132 @@ def incremental_sfm(
 
     logger.info("Registered %d / %d cameras", len(cameras), num_images)
 
-    # Build tracks by collecting 2D measurements across images
-    # Simple approach: for each verified pair, triangulate matches
-    tracks = []
+    # Build multi-view tracks using Union-Find, then triangulate.
+    tracks = _build_multiview_tracks(
+        keypoints_list, verified_corr_dict, cameras, image_sizes,
+    )
+
+    return cameras, tracks
+
+
+# ---------------------------------------------------------------------------
+# Union-Find for multi-view track merging
+# ---------------------------------------------------------------------------
+
+class _UnionFind:
+    """Weighted quick-union with path compression."""
+
+    def __init__(self) -> None:
+        self._parent: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        self._rank: Dict[Tuple[int, int], int] = {}
+
+    def find(self, x: Tuple[int, int]) -> Tuple[int, int]:
+        if x not in self._parent:
+            self._parent[x] = x
+            self._rank[x] = 0
+        while self._parent[x] != x:
+            self._parent[x] = self._parent[self._parent[x]]
+            x = self._parent[x]
+        return x
+
+    def union(self, a: Tuple[int, int], b: Tuple[int, int]) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self._rank[ra] < self._rank[rb]:
+            ra, rb = rb, ra
+        self._parent[rb] = ra
+        if self._rank[ra] == self._rank[rb]:
+            self._rank[ra] += 1
+
+
+def _build_multiview_tracks(
+    keypoints_list: List[Keypoints],
+    verified_corr_dict: Dict[Tuple[int, int], np.ndarray],
+    cameras: Dict[int, gtsam.Pose3],
+    image_sizes: Dict[int, Tuple[int, int]],
+) -> List[Dict]:
+    """Merge verified correspondences into multi-view tracks and triangulate.
+
+    Each observation is keyed by (image_idx, keypoint_idx). Union-Find merges
+    observations of the same physical point across all pairs, producing tracks
+    that can span many images.
+
+    Args:
+        keypoints_list: Keypoints per image.
+        verified_corr_dict: Verified correspondence indices per pair.
+        cameras: Registered camera poses (wTi).
+        image_sizes: Image sizes per camera index.
+
+    Returns:
+        List of track dicts with "point3d" and "measurements".
+    """
+    uf = _UnionFind()
+
+    # Merge across all verified pairs
     for (ia, ib), v_corrs in verified_corr_dict.items():
         if ia not in cameras or ib not in cameras:
             continue
-
-        Wa, Ha = image_sizes[ia]
-        Wb, Hb = image_sizes[ib]
-
         for match in v_corrs:
-            idx_a, idx_b = match
-            uv_a = keypoints_list[ia].coordinates[idx_a]
-            uv_b = keypoints_list[ib].coordinates[idx_b]
+            idx_a, idx_b = int(match[0]), int(match[1])
+            uf.union((ia, idx_a), (ib, idx_b))
 
-            bearing_a = gtsam.Unit3(pixels_to_bearings(uv_a.reshape(1, 2), Wa, Ha)[0])
-            bearing_b = gtsam.Unit3(pixels_to_bearings(uv_b.reshape(1, 2), Wb, Hb)[0])
+    # Group observations by their root
+    from collections import defaultdict
+    groups: Dict[Tuple[int, int], List[Tuple[int, int]]] = defaultdict(list)
+    for node in uf._parent:
+        root = uf.find(node)
+        groups[root].append(node)
 
-            pt, avg_err = triangulate_with_validation(
-                [cameras[ia], cameras[ib]],
-                [bearing_a, bearing_b],
-                max_angular_error_rad=np.deg2rad(2.0),
-                min_triangulation_angle_deg=0.5,
-            )
+    # Triangulate each track
+    tracks = []
+    for members in groups.values():
+        # Deduplicate by image index (keep first observation per image)
+        seen_images: Dict[int, np.ndarray] = {}
+        for img_idx, kp_idx in members:
+            if img_idx not in seen_images and img_idx in cameras:
+                seen_images[img_idx] = keypoints_list[img_idx].coordinates[kp_idx]
 
-            if pt is not None:
-                tracks.append({
-                    "point3d": pt,
-                    "measurements": [(ia, uv_a), (ib, uv_b)],
-                })
+        if len(seen_images) < 2:
+            continue
 
-    logger.info("Triangulated %d tracks", len(tracks))
+        cam_list = []
+        bearing_list = []
+        measurements = []
+        for img_idx, uv in seen_images.items():
+            W, H = image_sizes[img_idx]
+            bearing = gtsam.Unit3(pixels_to_bearings(uv.reshape(1, 2), W, H)[0])
+            cam_list.append(cameras[img_idx])
+            bearing_list.append(bearing)
+            measurements.append((img_idx, uv))
 
-    return cameras, tracks
+        pt, avg_err = triangulate_with_validation(
+            cam_list,
+            bearing_list,
+            max_angular_error_rad=np.deg2rad(2.0),
+            min_triangulation_angle_deg=0.5,
+        )
+
+        if pt is not None:
+            tracks.append({
+                "point3d": pt,
+                "measurements": measurements,
+            })
+
+    # Stats
+    track_lengths = [len(t["measurements"]) for t in tracks]
+    if track_lengths:
+        logger.info(
+            "Built %d multi-view tracks (mean length %.1f, max %d, 3+ views: %d)",
+            len(tracks),
+            np.mean(track_lengths),
+            max(track_lengths),
+            sum(1 for l in track_lengths if l >= 3),
+        )
+    else:
+        logger.warning("No tracks could be triangulated.")
+
+    return tracks
 
 
 def save_results(
@@ -480,6 +586,8 @@ def run_spherical_sfm(
     estimation_threshold_rad: float = 0.002,
     run_ba: bool = True,
     ba_measurement_noise_sigma: float = 0.001,
+    feature_type: str = "aliked",
+    matcher_type: str = "lightglue",
 ) -> Tuple[Dict[int, gtsam.Pose3], List[Dict]]:
     """Run the full spherical SfM pipeline.
 
@@ -487,12 +595,14 @@ def run_spherical_sfm(
         dataset_dir: Path to dataset directory.
         images_dir: Path to images (default: dataset_dir/images).
         output_dir: Output directory (default: dataset_dir/output).
-        max_keypoints: Max SIFT keypoints per image.
+        max_keypoints: Max keypoints per image.
         max_frame_lookahead: Max frame difference for pairs.
         ratio_test_threshold: Lowe's ratio test threshold.
         estimation_threshold_rad: Angular threshold for verification RANSAC.
         run_ba: Whether to run bundle adjustment.
         ba_measurement_noise_sigma: BA measurement noise sigma.
+        feature_type: Feature detector/descriptor ("sift" or "aliked").
+        matcher_type: Matcher ("twoway" or "lightglue").
 
     Returns:
         cameras: Final camera poses.
@@ -522,8 +632,9 @@ def run_spherical_sfm(
     logger.info("-" * 60)
     logger.info("STEP 1: Feature Detection")
     logger.info("-" * 60)
+    logger.info("Feature type: %s, Matcher: %s", feature_type, matcher_type)
     keypoints_list, descriptors_list = detect_and_describe_all(
-        loader, max_keypoints=max_keypoints
+        loader, max_keypoints=max_keypoints, feature_type=feature_type,
     )
 
     # 3. Feature matching
@@ -536,6 +647,8 @@ def run_spherical_sfm(
         loader,
         max_frame_lookahead=max_frame_lookahead,
         ratio_test_threshold=ratio_test_threshold,
+        matcher_type=matcher_type,
+        feature_type=feature_type,
     )
     logger.info("Total pairs with matches: %d", len(matches_dict))
 
@@ -612,6 +725,8 @@ def main():
     parser.add_argument("--threshold_rad", type=float, default=0.002, help="RANSAC angular threshold (radians)")
     parser.add_argument("--no_ba", action="store_true", help="Skip bundle adjustment")
     parser.add_argument("--ba_noise", type=float, default=0.001, help="BA measurement noise sigma")
+    parser.add_argument("--features", default="aliked", choices=["sift", "aliked"], help="Feature type")
+    parser.add_argument("--matcher", default="lightglue", choices=["twoway", "lightglue"], help="Matcher type")
     args = parser.parse_args()
 
     run_spherical_sfm(
@@ -624,6 +739,8 @@ def main():
         estimation_threshold_rad=args.threshold_rad,
         run_ba=not args.no_ba,
         ba_measurement_noise_sigma=args.ba_noise,
+        feature_type=args.features,
+        matcher_type=args.matcher,
     )
 
 
