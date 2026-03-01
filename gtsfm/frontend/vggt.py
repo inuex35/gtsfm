@@ -639,6 +639,7 @@ def _convert_vggt_outputs_to_gtsfm_data(
                     use_calibration_prior=config.ba_use_calibration_prior,
                     use_gnc=config.use_gnc,
                     gnc_loss=config.gnc_loss,
+                    factor_weight_outlier_threshold=config.factor_weight_outlier_threshold,
                 )
                 gtsfm_data_with_ba, _, weights = optimizer.run_simple_ba(gtsfm_data)
                 gtsfm_data_with_ba = gtsfm_data_with_ba.filter_landmark_measurements(config.post_ba_max_reproj_error)

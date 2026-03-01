@@ -14,7 +14,6 @@ import gtsam  # type: ignore
 import numpy as np
 from gtsam import Pose3, SfmTrack, Similarity3, Values
 from gtsam.symbol_shorthand import K, P, X  # type: ignore
-from numpy.typing import NDArray
 
 import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.graph as graph_utils
@@ -1226,3 +1225,5 @@ class GtsfmData:
         self.write_cameras(save_dir)
         self.write_images(save_dir)
         self.write_points(save_dir)
+
+
