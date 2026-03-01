@@ -6,7 +6,6 @@ Authors: John Lambert
 import unittest
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from gtsfm.frontend.global_descriptor import NetVLAD
