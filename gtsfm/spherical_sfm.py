@@ -214,6 +214,7 @@ def incremental_sfm(
     verified_corr_dict: Dict[Tuple[int, int], np.ndarray],
     image_sizes: Dict[int, Tuple[int, int]],
     num_images: int,
+    loader: Optional[EquirectangularLoader] = None,
 ) -> Tuple[Dict[int, gtsam.Pose3], List[Dict]]:
     """Run incremental SfM to build the reconstruction.
 
@@ -312,7 +313,7 @@ def incremental_sfm(
 
     # Build multi-view tracks using Union-Find, then triangulate.
     tracks = _build_multiview_tracks(
-        keypoints_list, verified_corr_dict, cameras, image_sizes,
+        keypoints_list, verified_corr_dict, cameras, image_sizes, loader,
     )
 
     return cameras, tracks
@@ -349,11 +350,33 @@ class _UnionFind:
             self._rank[ra] += 1
 
 
+def _sample_color(loader: EquirectangularLoader, img_idx: int, uv: np.ndarray) -> Tuple[int, int, int]:
+    """Sample RGB color from an image at the given pixel coordinate.
+
+    Args:
+        loader: Image loader.
+        img_idx: Image index.
+        uv: (2,) pixel coordinate [u, v].
+
+    Returns:
+        (R, G, B) tuple with values in [0, 255].
+    """
+    image = loader.get_image(img_idx)
+    arr = image.value_array  # (H, W, 3) uint8
+    H, W = arr.shape[:2]
+    u, v = int(round(uv[0])), int(round(uv[1]))
+    u = max(0, min(u, W - 1))
+    v = max(0, min(v, H - 1))
+    r, g, b = arr[v, u, 0], arr[v, u, 1], arr[v, u, 2]
+    return int(r), int(g), int(b)
+
+
 def _build_multiview_tracks(
     keypoints_list: List[Keypoints],
     verified_corr_dict: Dict[Tuple[int, int], np.ndarray],
     cameras: Dict[int, gtsam.Pose3],
     image_sizes: Dict[int, Tuple[int, int]],
+    loader: Optional[EquirectangularLoader] = None,
 ) -> List[Dict]:
     """Merge verified correspondences into multi-view tracks and triangulate.
 
@@ -366,9 +389,10 @@ def _build_multiview_tracks(
         verified_corr_dict: Verified correspondence indices per pair.
         cameras: Registered camera poses (wTi).
         image_sizes: Image sizes per camera index.
+        loader: Optional image loader for sampling point colors.
 
     Returns:
-        List of track dicts with "point3d" and "measurements".
+        List of track dicts with "point3d", "measurements", and "rgb".
     """
     uf = _UnionFind()
 
@@ -386,6 +410,13 @@ def _build_multiview_tracks(
     for node in uf._parent:
         root = uf.find(node)
         groups[root].append(node)
+
+    # Pre-load image arrays for color sampling (load each image once)
+    image_cache: Dict[int, np.ndarray] = {}
+    if loader is not None:
+        for img_idx in cameras:
+            image_cache[img_idx] = loader.get_image(img_idx).value_array
+        logger.info("Cached %d images for color sampling", len(image_cache))
 
     # Triangulate each track
     tracks = []
@@ -417,9 +448,19 @@ def _build_multiview_tracks(
         )
 
         if pt is not None:
+            # Sample color from the first observing image
+            rgb = (128, 128, 128)
+            first_img_idx, first_uv = measurements[0]
+            if first_img_idx in image_cache:
+                arr = image_cache[first_img_idx]
+                H, W = arr.shape[:2]
+                u = max(0, min(int(round(first_uv[0])), W - 1))
+                v = max(0, min(int(round(first_uv[1])), H - 1))
+                rgb = (int(arr[v, u, 0]), int(arr[v, u, 1]), int(arr[v, u, 2]))
             tracks.append({
                 "point3d": pt,
                 "measurements": measurements,
+                "rgb": rgb,
             })
 
     # Stats
@@ -467,25 +508,24 @@ def save_results(
             f.write(f"{cam_idx} {t[0]:.6f} {t[1]:.6f} {t[2]:.6f} "
                     f"{q.w():.6f} {q.x():.6f} {q.y():.6f} {q.z():.6f}\n")
 
-    # Save point cloud as PLY
-    points = []
-    for track in tracks:
-        pt = track["point3d"]
-        points.append(pt)
-
-    if points:
-        points_arr = np.array(points)
+    # Save point cloud as PLY with RGB color
+    if tracks:
         ply_file = os.path.join(output_dir, "point_cloud.ply")
         with open(ply_file, "w") as f:
             f.write("ply\n")
             f.write("format ascii 1.0\n")
-            f.write(f"element vertex {len(points_arr)}\n")
+            f.write(f"element vertex {len(tracks)}\n")
             f.write("property float x\n")
             f.write("property float y\n")
             f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
             f.write("end_header\n")
-            for pt in points_arr:
-                f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}\n")
+            for track in tracks:
+                pt = track["point3d"]
+                r, g, b = track.get("rgb", (128, 128, 128))
+                f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} {r} {g} {b}\n")
 
     # Save in COLMAP text format for use with GTSFM viewers
     colmap_dir = os.path.join(output_dir, "ba_output")
@@ -494,8 +534,8 @@ def save_results(
 
     logger.info("Results saved to %s", output_dir)
     logger.info("  Camera poses: %s", poses_file)
-    if points:
-        logger.info("  Point cloud: %s (%d points)", ply_file, len(points))
+    if tracks:
+        logger.info("  Point cloud: %s (%d points)", ply_file, len(tracks))
     logger.info("  COLMAP format: %s", colmap_dir)
 
 
@@ -572,8 +612,9 @@ def _save_colmap_format(
             track_str = ""
             for m_idx, (img_idx, _uv) in enumerate(track.get("measurements", [])):
                 track_str += f" {img_idx + 1} {m_idx}"
+            r, g, b = track.get("rgb", (128, 128, 128))
             f.write(f"{pt_id + 1} {pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} "
-                    f"128 128 128 0.0{track_str}\n")
+                    f"{r} {g} {b} 0.0{track_str}\n")
 
 
 def run_spherical_sfm(
@@ -675,6 +716,7 @@ def run_spherical_sfm(
         verified_corr_dict,
         image_sizes,
         num_images,
+        loader,
     )
 
     if not cameras:

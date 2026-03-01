@@ -191,6 +191,7 @@ class SphericalBundleAdjustment:
             new_track = {
                 "point3d": opt_point,
                 "measurements": track["measurements"],
+                "rgb": track.get("rgb", (128, 128, 128)),
             }
 
             # Compute reprojection errors
