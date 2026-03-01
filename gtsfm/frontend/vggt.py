@@ -22,7 +22,6 @@ from gtsam import Point2, Point3
 from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptimizer, RobustBAMode
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.utils import data_utils
-from gtsfm.utils.reprojection import compute_track_reprojection_errors
 from gtsfm.utils import logger as logger_utils
 from gtsfm.utils import torch as torch_utils
 
@@ -30,51 +29,11 @@ PathLike = Union[str, Path]
 
 logger = logger_utils.get_logger()
 
-_RESNET_MEAN = [0.485, 0.456, 0.406]
-_RESNET_STD = [0.229, 0.224, 0.225]
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225]
 
 # Per-worker cache for DINOv2 model to avoid reloading per cluster/task.
 _DINO_V2_MODEL_CACHE: dict[tuple[str, str], Any] = {}
-
-
-def _log_reproj_error_stats(scene: Optional[GtsfmData], label: str) -> None:
-    """Log reprojection error statistics (copied from cluster_merging)."""
-    if scene is None:
-        logger.info("📏 %s reprojection error stats unavailable", label)
-        return
-    cameras = scene.cameras()
-    if len(cameras) == 0 or scene.number_tracks() == 0:
-        logger.info("📏 %s reprojection error stats unavailable", label)
-        return
-    error_blocks: list[np.ndarray] = []
-    for track in scene.tracks():
-        if track.numberMeasurements() == 0:
-            continue
-        errors, _ = compute_track_reprojection_errors(cameras, track)
-        if errors.size == 0:
-            continue
-        valid_errors = errors[~np.isnan(errors)]
-        if valid_errors.size > 0:
-            error_blocks.append(valid_errors)
-    if len(error_blocks) == 0:
-        logger.info("📏 %s reprojection error stats unavailable", label)
-        return
-    all_errors = np.concatenate(error_blocks)
-    mean = float(np.mean(all_errors))
-    median = float(np.median(all_errors))
-    min_err = float(np.min(all_errors))
-    max_err = float(np.max(all_errors))
-    logger.info(
-        "📏 %s reprojection error (px): mean=%.2f median=%.2f min=%.2f max=%.2f, #cameras=%d, #tracks=%d, #images=%d",
-        label,
-        mean,
-        median,
-        min_err,
-        max_err,
-        len(scene.cameras()),
-        scene.number_tracks(),
-        scene.number_images(),
-    )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -869,12 +828,12 @@ def generate_rank_by_dino(
         logger.info("✅ DINOv2 model loaded successfully.")
 
     # Normalize images using ResNet normalization
-    resnet_mean = torch.tensor(_RESNET_MEAN, device=device).view(1, 3, 1, 1)
-    resnet_std = torch.tensor(_RESNET_STD, device=device).view(1, 3, 1, 1)
-    images_resnet_norm = (images - resnet_mean) / resnet_std
+    imagenet_mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    imagenet_std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    images_imagenet_norm = (images - imagenet_mean) / imagenet_std
 
     with torch.no_grad():
-        frame_feat = dino_v2_model(images_resnet_norm, is_training=True)
+        frame_feat = dino_v2_model(images_imagenet_norm, is_training=True)
 
     # Process features based on similarity type
     if spatial_similarity:
