@@ -1225,5 +1225,3 @@ class GtsfmData:
         self.write_cameras(save_dir)
         self.write_images(save_dir)
         self.write_points(save_dir)
-
-
