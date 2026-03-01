@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from dask.delayed import Delayed, delayed
 from gtsam import Pose3
+from PIL import Image as PILImage
 
 import gtsfm.common.types as gtsfm_types
 import gtsfm.frontend.vggt as vggt
@@ -27,9 +28,62 @@ logger = get_logger()
 _VGGT_MODEL_CACHE: dict[Hashable, Any] = {}
 
 
-def _load_vggt_inputs(loader, indices: list[int], mode: str):
+def _load_vggt_inputs(
+    loader,
+    indices: list[int],
+    mode: str,
+    *,
+    save_processed_image: bool = False,
+    output_root: Optional[str] = None,
+    image_names: Optional[tuple[str, ...]] = None,
+):
     """Load and preprocess a batch of images for VGGT."""
-    return vggt.load_image_batch_vggt_loader(loader, indices, mode=mode)
+    image_batch, original_coords = vggt.load_image_batch_vggt_loader(loader, indices, mode=mode)
+    if not save_processed_image or output_root is None or image_names is None:
+        return image_batch, original_coords
+    if len(image_names) != image_batch.shape[0]:
+        logger.warning(
+            "Skipping processed-image dump due to length mismatch: got %d names for %d images.",
+            len(image_names),
+            image_batch.shape[0],
+        )
+        return image_batch, original_coords
+    
+    target_root = Path(output_root) / "processed_images"
+    target_root.mkdir(parents=True, exist_ok=True)
+    batch_uint8 = (
+        image_batch.detach()
+        .clamp(0.0, 1.0)
+        .mul(255.0)
+        .add(0.5)
+        .to(torch.uint8)
+        .permute(0, 2, 3, 1)
+        .cpu()
+        .numpy()
+    )
+    for i, image_name in enumerate(image_names):
+        relpath = Path(image_name)
+        save_path = target_root / relpath
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        PILImage.fromarray(batch_uint8[i]).save(save_path)
+    original_coords_np = original_coords.detach().cpu().numpy()
+    num_coord_cols = original_coords_np.shape[1]
+    if num_coord_cols == 6:
+        coord_headers = ["left", "top", "right", "bottom", "scaled_width", "scaled_height"]
+    else:
+        coord_headers = [f"coord_{i}" for i in range(num_coord_cols)]
+    rows = np.empty((len(image_names), num_coord_cols + 1), dtype=object)
+    rows[:, 0] = np.asarray(image_names, dtype=object)
+    rows[:, 1:] = original_coords_np
+    np.savetxt(
+        target_root / "original_coords.txt",
+        rows,
+        fmt=["%s"] + ["%.8f"] * num_coord_cols,
+        delimiter="\t",
+        header="\t".join(["image_name", *coord_headers]),
+        comments="",
+    )
+    return image_batch, original_coords
 
 
 def _resolve_vggt_model(cache_key: Hashable | None, loader_kwargs: dict[str, Any] | None) -> Any | None:
@@ -201,6 +255,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         track_conf_thresh: float = 0.2,
         keypoint_extractor: str = "aliked+sp+sift",
         input_mode: str = "crop",
+        save_processed_image: bool = False,
         camera_type: str = "PINHOLE",
         seed: int = 42,
         scene_dir: Optional[str] = None,
@@ -261,6 +316,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         self._track_conf_thresh = track_conf_thresh
         self._keypoint_extractor = keypoint_extractor
         self._input_mode = input_mode
+        self._save_processed_image = save_processed_image
         self._camera_type = camera_type
         self._vggt_max_reproj_error = vggt_max_reproj_error
         self._min_triangulation_angle = min_triangulation_angle
@@ -325,6 +381,7 @@ class ClusterVGGT(ClusterOptimizerBase):
             f"camera_type={self._camera_type}",
             f"dtype={self._dtype}",
             f"input_mode={self._input_mode}",
+            f"save_processed_image={self._save_processed_image}",
             f"use_sparse_attention={self._use_sparse_attention}",
             f"run_bundle_adjustment_on_leaf={self._run_bundle_adjustment_on_leaf}",
         ]
@@ -385,7 +442,12 @@ class ClusterVGGT(ClusterOptimizerBase):
         )
 
         image_batch_graph, original_coords_graph = delayed(_load_vggt_inputs, nout=2)(
-            context.loader, global_indices, mode=self._input_mode
+            context.loader,
+            global_indices,
+            mode=self._input_mode,
+            save_processed_image=self._save_processed_image,
+            output_root=str(context.output_paths.results),
+            image_names=image_names,
         )
 
         reconstruction_graph = delayed(_run_vggt_pipeline)(
