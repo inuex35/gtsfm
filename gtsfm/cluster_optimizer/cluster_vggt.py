@@ -8,12 +8,12 @@ from typing import Any, Hashable, Optional, Union
 import numpy as np
 import torch
 from dask.delayed import Delayed, delayed
+from gtsam import Pose3
 from PIL import Image as PILImage
 
 import gtsfm.common.types as gtsfm_types
 import gtsfm.frontend.vggt as vggt
 import gtsfm.utils.metrics as metrics_utils
-from gtsam import Pose3
 from gtsfm.cluster_optimizer.cluster_optimizer_base import ClusterComputationGraph, ClusterContext, ClusterOptimizerBase
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
@@ -286,6 +286,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         use_shared_calibration: bool = True,
         use_gnc: bool = False,
         gnc_loss: str = "GMC",
+        factor_weight_outlier_threshold: float = 1e-8,
         min_track_length: int = 2,
         keep_all_cameras_in_merging: bool = False,
     ) -> None:
@@ -330,6 +331,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         self._ba_use_undistorted_camera_model = ba_use_undistorted_camera_model
         self._use_gnc = use_gnc
         self._gnc_loss = gnc_loss
+        self._factor_weight_outlier_threshold = factor_weight_outlier_threshold
         if fast_dtype is not None:
             if self._dtype is None:
                 self._dtype = fast_dtype
@@ -435,11 +437,10 @@ class ClusterVGGT(ClusterOptimizerBase):
             ba_use_shared_calibration=self.use_shared_calibration,
             use_gnc=self._use_gnc,
             gnc_loss=self._gnc_loss,
+            factor_weight_outlier_threshold=self._factor_weight_outlier_threshold,
             min_track_length=self.min_track_length,
         )
 
-        # mode is fixed to "crop", it resizes the width to 518 while maintaining aspect ratio and only if
-        # height is > 518 then crops
         image_batch_graph, original_coords_graph = delayed(_load_vggt_inputs, nout=2)(
             context.loader,
             global_indices,
