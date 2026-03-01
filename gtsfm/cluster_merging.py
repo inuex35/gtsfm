@@ -687,7 +687,7 @@ def combine_results(
             use_gnc=use_gnc,
             gnc_loss=gnc_loss,
         )
-        merged_with_ba, _, weights = optimizer.run_simple_ba(merged)
+        merged_with_ba, _ = optimizer.run_simple_ba(merged)
         _propagate_scene_metadata(merged_with_ba, merged)
         _log_scene_reprojection_stats(
             merged_with_ba,

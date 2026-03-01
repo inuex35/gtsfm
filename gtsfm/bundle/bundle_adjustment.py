@@ -404,7 +404,7 @@ class BundleAdjustmentOptimizer:
 
     def __optimize_and_recover(
         self, initial_data: GtsfmData, graph: NonlinearFactorGraph, ordering_type: str
-    ) -> Tuple[GtsfmData, Values, float, Optional[NDArray[np.float64]]]:
+    ) -> Tuple[GtsfmData, Values, float]:
         """Optimize the graph, report errors, and convert `Values` back to `GtsfmData`."""
         initial_values = initial_data.to_values(shared_calib=self._shared_calib)
         result_values, _, weights = self.__optimize_factor_graph(graph, initial_values, ordering_type)
@@ -412,7 +412,7 @@ class BundleAdjustmentOptimizer:
         optimized_data = GtsfmData.from_values(result_values, initial_data, self._shared_calib)
         if self._use_gnc and weights is not None:
             optimized_data = self.__filter_tracks_by_factor_weights(graph, optimized_data, weights)
-        return optimized_data, result_values, final_error, weights
+        return optimized_data, result_values, final_error
 
     def __filter_tracks_by_factor_weights(
         self, graph: NonlinearFactorGraph, optimized_data: GtsfmData, weights: NDArray[np.float64]
@@ -450,7 +450,7 @@ class BundleAdjustmentOptimizer:
 
     def run_simple_ba(
         self, initial_data: GtsfmData, robust_noise_basin: float | None = None
-    ) -> Tuple[GtsfmData, float, Optional[NDArray[np.float64]]]:
+    ) -> Tuple[GtsfmData, float]:
         """Runs bundle adjustment and optionally filters the resulting tracks by reprojection error.
 
         Args:
@@ -468,22 +468,21 @@ class BundleAdjustmentOptimizer:
         )
         if len(cameras_without_tracks) == len(initial_data.cameras()):
             logger.warning("Skipping bundle adjustment because all cameras are without tracks.")
-            return initial_data, 0.0, None
-        optimized_data, _, final_error, weights = self.__optimize_and_recover(
+            return initial_data, 0.0
+        optimized_data, _, final_error = self.__optimize_and_recover(
             initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
         )
-        return optimized_data, final_error, weights
+        return optimized_data, final_error
 
     def run_iterative_robust_ba(
         self, initial_data: GtsfmData, robust_noise_basins: List[float]
-    ) -> Tuple[GtsfmData, float, Optional[NDArray[np.float64]]]:
+    ) -> Tuple[GtsfmData, float]:
         """Runs iterative robust bundle adjustment, using different robust noise basins for each iteration."""
         optimized_data = initial_data
         final_error = float("nan")
-        weights = None
         for robust_noise_basin in robust_noise_basins:
-            optimized_data, final_error, weights = self.run_simple_ba(optimized_data, robust_noise_basin)
-        return optimized_data, final_error, weights
+            optimized_data, final_error = self.run_simple_ba(optimized_data, robust_noise_basin)
+        return optimized_data, final_error
 
     def run_ba_stage_with_filtering(
         self,
@@ -492,7 +491,7 @@ class BundleAdjustmentOptimizer:
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         reproj_error_thresh: Optional[float],
         verbose: bool = True,
-    ) -> Tuple[GtsfmData, GtsfmData, List[bool], float, Optional[NDArray[np.float64]]]:
+    ) -> Tuple[GtsfmData, GtsfmData, List[bool], float]:
         """Runs bundle adjustment and optionally filters the resulting tracks by reprojection error.
 
         Args:
@@ -508,7 +507,6 @@ class BundleAdjustmentOptimizer:
             Valid mask as a list of booleans, indicating for each input track whether it was below the re-projection
                 threshold.
             Final error value of the optimization problem.
-            Weights of the factors if Gnc optimization is used, else None.
         """
         logger.info(
             "Input: %d tracks on %d cameras", initial_data.number_tracks(), len(initial_data.get_valid_camera_indices())
@@ -524,7 +522,7 @@ class BundleAdjustmentOptimizer:
         graph, cameras_without_tracks = self.__construct_factor_graph(
             cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors
         )
-        optimized_data, result_values, final_error, weights = self.__optimize_and_recover(
+        optimized_data, result_values, final_error = self.__optimize_and_recover(
             initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
         )
 
@@ -541,7 +539,7 @@ class BundleAdjustmentOptimizer:
                     logger.error(
                         "BA result discarded due to Indeterminate Linear System (ILS) when computing marginals."
                     )
-                    return None, None, None, None, None
+                    return None, None, None, None
 
         # Convert the `Values` results to a `GtsfmData` instance.
         # Filter landmarks by reprojection error.
@@ -555,7 +553,7 @@ class BundleAdjustmentOptimizer:
         else:
             valid_mask = [True] * optimized_data.number_tracks()
             filtered_result = optimized_data
-        return optimized_data, filtered_result, valid_mask, final_error, weights
+        return optimized_data, filtered_result, valid_mask, final_error
 
     def run_ba(
         self,
@@ -581,7 +579,7 @@ class BundleAdjustmentOptimizer:
         num_ba_steps = len(self._reproj_error_thresholds)
         for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
             # Use intermediate result as initial condition for next step.
-            (optimized_data, filtered_result, valid_mask, final_error, weights) = self.run_ba_stage_with_filtering(
+            (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
                 initial_data,
                 absolute_pose_priors,
                 relative_pose_priors,
@@ -629,7 +627,7 @@ class BundleAdjustmentOptimizer:
 
         for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
             step_start_time = time.time()
-            (optimized_data, filtered_result, valid_mask, final_error, weights) = self.run_ba_stage_with_filtering(
+            (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
                 initial_data=initial_data,
                 absolute_pose_priors=absolute_pose_priors,
                 relative_pose_priors=relative_pose_priors,
