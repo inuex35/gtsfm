@@ -2,26 +2,26 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
-import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import gtsam
 import numpy as np
 from dask.distributed import Client, Future
-from gtsam import Similarity3, Pose3, UnaryMeasurementPose3, TrajectoryAlignerSim3
+from gtsam import Pose3, Similarity3, TrajectoryAlignerSim3, UnaryMeasurementPose3
 
-import gtsfm.utils.logger as logger_utils
 import gtsfm.common.types as gtsfm_types
+import gtsfm.utils.logger as logger_utils
+import gtsfm.utils.metrics as metrics_utils
 from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptimizer, RobustBAMode
 from gtsfm.cluster_optimizer.cluster_anysplat import save_splats
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
 from gtsfm.utils import align as align_utils
 from gtsfm.utils import data_utils
-import gtsfm.utils.metrics as metrics_utils
 from gtsfm.utils.reprojection import compute_track_reprojection_errors
 from gtsfm.utils.splat import GaussiansProtocol, merge_gaussian_splats
 from gtsfm.utils.transform import transform_gaussian_splats
@@ -30,6 +30,7 @@ from gtsfm.utils.tree_dask import submit_tree_map
 
 if TYPE_CHECKING:
     from gtsfm.scene_optimizer import ClusterExecutionHandles
+
 
 logger = logger_utils.get_logger()
 
@@ -50,7 +51,7 @@ def _create_unary_measurements(scene: GtsfmData) -> list[UnaryMeasurementPose3]:
         if camera is None:
             continue
         noise_model = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1]) / np.sqrt(num_good_measurements[i])
+            np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1]) / np.sqrt(num_good_measurements.get(i, 0) + 1e-6)
         )
         unary_measurement = UnaryMeasurementPose3(i, camera, noise_model)
         unary_measurements.append(unary_measurement)
@@ -285,7 +286,32 @@ def _get_pose_metrics(
 
     aligned_result_data = result_data.align_via_sim3_and_transform(poses_gt)
     return metrics_utils.compute_ba_pose_metrics(
-        gt_wTi=poses_gt, computed_wTi=aligned_result_data.get_camera_poses(), save_dir=save_dir, store_full_data=True
+        gt_wTi=poses_gt, computed_wTi=aligned_result_data.get_camera_poses(), save_dir=save_dir, store_full_data=False
+    )
+
+
+def _get_intrinsics_metrics(
+    result_data: GtsfmData,
+    cameras_gt: list[Optional[gtsfm_types.CAMERA_TYPE]],
+) -> GtsfmMetricsGroup:
+    """Compute intrinsics metrics for a merged result against ground truth cameras."""
+    image_idxs = list(result_data._image_info.keys())
+    gt_cameras: dict[int, gtsfm_types.CAMERA_TYPE] = {}
+    computed_cameras: dict[int, gtsfm_types.CAMERA_TYPE] = {}
+    for i in image_idxs:
+        if i >= len(cameras_gt):
+            continue
+        gt_cam = cameras_gt[i]
+        est_cam = result_data.get_camera(i)
+        if gt_cam is not None and est_cam is not None:
+            gt_cameras[i] = gt_cam
+            computed_cameras[i] = est_cam
+    if len(gt_cameras) == 0:
+        return GtsfmMetricsGroup(name="intrinsics_metrics", metrics=[])
+    return metrics_utils.compute_intrinsics_metrics(
+        gt_cameras=gt_cameras,
+        computed_cameras=computed_cameras,
+        store_full_data=True,
     )
 
 
@@ -341,6 +367,7 @@ def compute_merging_metrics(
             save_dir=pose_save_dir,
         )
         merging_metrics.extend(ba_pose_error_metrics)
+        merging_metrics.extend(_get_intrinsics_metrics(merged_scene, cameras_gt))
     return merging_metrics
 
 
@@ -474,6 +501,7 @@ def combine_results(
     child_results: tuple[MergedNodeResult, ...],
     *,
     cameras_gt: Optional[list[Optional[gtsfm_types.CAMERA_TYPE]]] = None,
+    post_ba_max_reproj_error: float = 3.0,
     run_bundle_adjustment_on_parent: bool = True,
     plot_reprojection_histograms: bool = True,
     merge_duplicate_tracks: bool = True,
@@ -482,7 +510,14 @@ def combine_results(
     drop_child_if_merging_fail: bool = True,
     store_full_data: bool = False,
     use_nonlinear_sim3_alignment: bool = False,
+    min_track_length: int = 2,
     use_shared_calibration: bool = True,
+    use_gnc: bool = False,
+    gnc_loss: RobustBAMode | str = RobustBAMode.GMC,
+    keep_all_cameras_in_merging: bool,
+    pre_ba_max_reproj_error: float = 14.0,
+    pre_ba_min_track_length: int = 2,
+    ba_use_calibration_prior: bool = False,
 ) -> MergedNodeResult:
     """Run the merging and parent BA pipeline using already-transformed children.
 
@@ -496,6 +531,9 @@ def combine_results(
         drop_camera_with_no_track: Whether to drop cameras with no tracks.
         drop_child_if_merging_fail: Whether to drop child scenes if merging fails.
         store_full_data: Whether to store full data for the merging metrics.
+        use_gnc: Use the GNC optimizer for bundle adjustment.
+        gnc_loss: GNC loss to use. Defaults to GMC.
+        keep_all_cameras_in_merging: Keep all cameras after post-BA track filtering, even if they have no tracks.
 
     Returns:
         A MergedNodeResult object containing the merged scene and its metrics.
@@ -565,7 +603,7 @@ def combine_results(
         for i, child in enumerate(valid_child_scenes):
             merged = _align_and_merge_results(merged, child, drop_if_merging_fails=drop_child_if_merging_fail)
             _log_scene_reprojection_stats(
-                merged, f"Merged with child #{i+1}", plot_histograms=plot_reprojection_histograms
+                merged, f"Merged with child #{i + 1}", plot_histograms=plot_reprojection_histograms
             )
 
     _propagate_scene_metadata(merged, metadata_source)
@@ -637,13 +675,17 @@ def combine_results(
     else:
         logger.info("📌 Retaining zero-track cameras before parent BA (drop disabled).")
 
+    if pre_ba_max_reproj_error > 0.0:
+        merged = merged.filter_landmark_measurements(pre_ba_max_reproj_error, pre_ba_min_track_length)
     try:
         optimizer = BundleAdjustmentOptimizer(
             robust_ba_mode=RobustBAMode.HUBER,
             calibration_prior_focal_sigma=10.0,
-            use_calibration_prior=True,
+            use_calibration_prior=ba_use_calibration_prior,
             shared_calib=use_shared_calibration,
             robust_noise_basin=0.5,
+            use_gnc=use_gnc,
+            gnc_loss=gnc_loss,
         )
         merged_with_ba, _ = optimizer.run_simple_ba(merged)
         _propagate_scene_metadata(merged_with_ba, merged)
@@ -654,12 +696,22 @@ def combine_results(
         )
         if drop_outlier_after_camera_merging:
             merged_with_ba = _drop_outlier_tracks(merged_with_ba)
-            _log_scene_reprojection_stats(
-                merged_with_ba,
-                "merged result (with ba + outlier filtering)",
-                plot_histograms=plot_reprojection_histograms,
-            )
+        _log_scene_reprojection_stats(
+            merged_with_ba,
+            "merged result (drop_outlier_after_camera_merging)",
+            plot_histograms=plot_reprojection_histograms,
+        )
 
+        merged_with_ba = merged_with_ba.filter_landmark_measurements(
+            post_ba_max_reproj_error,
+            min_track_length,
+            retain_cameras_without_tracks=keep_all_cameras_in_merging,
+        )
+        _log_scene_reprojection_stats(
+            merged_with_ba,
+            "merged result (with ba + outlier filtering)",
+            plot_histograms=plot_reprojection_histograms,
+        )
         # TODO: the order here is different from the merging order above, we should fix this.
         if merged.has_gaussian_splats():
             logger.info("🫱🏻‍🫲🏽 Merging Gaussians")

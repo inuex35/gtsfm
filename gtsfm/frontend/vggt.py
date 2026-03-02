@@ -13,6 +13,7 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from gtsam import Point2, Point3
 from PIL import Image as PILImage
 from torch.amp import autocast as amp_autocast  # type: ignore
@@ -23,11 +24,17 @@ from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.utils import data_utils
 from gtsfm.utils import logger as logger_utils
 from gtsfm.utils import torch as torch_utils
-from gtsfm.densify import mvs_utils
 
 PathLike = Union[str, Path]
 
 logger = logger_utils.get_logger()
+
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# Per-worker cache for DINOv2 model to avoid reloading per cluster/task.
+_DINO_V2_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 THIRDPARTY_ROOT = REPO_ROOT / "thirdparty"
@@ -179,6 +186,8 @@ def load_image_batch_vggt_loader(loader, indices: List[int], mode="crop"):
     to_tensor = TF.ToTensor()
     target_size = 518
 
+    coords = []
+
     # First process all images and collect their shapes
     for idx in indices:
         # Open image
@@ -206,13 +215,19 @@ def load_image_batch_vggt_loader(loader, indices: List[int], mode="crop"):
         img = img.resize((new_width, new_height), PILImage.Resampling.BICUBIC)
         img = to_tensor(img)  # Convert to tensor (0, 1)
 
+        # left, top, bottom, right of grid with respect to original image, scaled full width, scaled full height
+        coord = np.array([0.0, 0.0, float(new_width), float(new_height), float(new_width), float(new_height)])
+
         # Center crop height if it's larger than 518 (only in crop mode)
         if mode == "crop" and new_height > target_size:
             start_y = (new_height - target_size) // 2
             img = img[:, start_y : start_y + target_size, :]
+            coord[1] = start_y
+            coord[3] = start_y + target_size
 
         # For pad mode, pad to make a square of target_size x target_size
-        if mode == "pad":
+        elif mode == "pad":
+            # TODO: what if h padding is negative?
             h_padding = target_size - img.shape[1]
             w_padding = target_size - img.shape[2]
 
@@ -222,6 +237,17 @@ def load_image_batch_vggt_loader(loader, indices: List[int], mode="crop"):
                 pad_left = w_padding // 2
                 pad_right = w_padding - pad_left
 
+                pad_left = max(0, pad_left)
+                pad_right = max(0, pad_right)
+                pad_top = max(0, pad_top)
+                pad_bottom = max(0, pad_bottom)
+
+                # Save the shape before padding.
+                coord[0] = -pad_left
+                coord[1] = -pad_top
+                coord[2] = pad_right + img.shape[2]
+                coord[3] = pad_bottom + img.shape[1]
+
                 # Pad with white (value=1.0)
                 img = torch.nn.functional.pad(
                     img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
@@ -229,6 +255,7 @@ def load_image_batch_vggt_loader(loader, indices: List[int], mode="crop"):
 
         shapes.add((img.shape[1], img.shape[2]))
         images.append(img)
+        coords.append(coord)
 
     # Check if we have different shapes
     # In theory our model can also work well with different shapes
@@ -240,7 +267,8 @@ def load_image_batch_vggt_loader(loader, indices: List[int], mode="crop"):
 
         # Pad images if necessary
         padded_images = []
-        for img in images:
+        padded_coords = []
+        for img, coord in zip(images, coords):
             h_padding = max_height - img.shape[1]
             w_padding = max_width - img.shape[2]
 
@@ -253,19 +281,24 @@ def load_image_batch_vggt_loader(loader, indices: List[int], mode="crop"):
                 img = torch.nn.functional.pad(
                     img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
                 )
+                coord[0] = coord[0] - pad_left
+                coord[1] = coord[1] - pad_top
+                coord[2] = coord[2] + pad_right
+                coord[3] = coord[3] + pad_bottom
+
+            padded_coords.append(coord)
             padded_images.append(img)
         images = padded_images
+        coords = padded_coords
 
     images = torch.stack(images)  # concatenate images
-
+    coords = np.array(coords)
     # Ensure correct shape when single image
     if len(indices) == 1:
         # Verify shape is (1, C, H, W)
         if images.dim() == 3:
             images = images.unsqueeze(0)
 
-    height, width = images.shape[-2], images.shape[-1]
-    coords = np.tile([0.0, 0.0, float(width), float(height), float(width), float(height)], (len(indices), 1))
     original_coords_tensor = torch.from_numpy(coords).float()
 
     return images, original_coords_tensor
@@ -291,13 +324,19 @@ class VggtConfiguration:
     track_vis_thresh: float = 0.05
     track_conf_thresh: float = 0.2
     keypoint_extractor: str = "aliked+sp+sift"
-    max_reproj_error: float = 14.0
+    vggt_max_reproj_error: float = 14.0
+    post_ba_max_reproj_error: float = 3.0
     min_triangulation_angle: float = 10.0
+    drop_camera_with_no_track: bool = False
+    min_track_length: int = 2
 
     # Bundle adjustment-specific parameters:
     ba_use_calibration_prior: bool = False
     ba_use_undistorted_camera_model: bool = False
     ba_use_shared_calibration: bool = True
+    use_gnc: bool = False
+    gnc_loss: str = "GMC"
+    factor_weight_outlier_threshold: float = 1e-8
 
 
 @dataclass
@@ -485,6 +524,7 @@ def _convert_vggt_outputs_to_gtsfm_data(
     points_3d: np.ndarray,
     points_rgb: np.ndarray,
     tracking_result: VGGTTrackingResult | None = None,
+    cluster_label: Optional[str] = None,
 ) -> tuple[GtsfmData, GtsfmData | None]:
     """Convert raw VGGT predictions into ``GtsfmData``."""
 
@@ -502,7 +542,10 @@ def _convert_vggt_outputs_to_gtsfm_data(
         scaled_intrinsic = intrinsic_np[local_idx]
 
         camera = torch_utils.camera_from_matrices(
-            extrinsic_np[local_idx], scaled_intrinsic, use_cal3_bundler=not config.ba_use_undistorted_camera_model
+            extrinsic_np[local_idx],
+            scaled_intrinsic,
+            crop_coords=original_coords_np[local_idx],
+            use_cal3_bundler=not config.ba_use_undistorted_camera_model,
         )
         gtsfm_data.add_camera(global_idx, camera)  # type: ignore[arg-type]
         gtsfm_data.set_image_info(
@@ -510,11 +553,6 @@ def _convert_vggt_outputs_to_gtsfm_data(
             name=image_names_str[local_idx] if image_names_str is not None else None,
             shape=(int(image_height), int(image_width)),
         )
-
-    if tracking_result is None and points_3d.size > 0 and points_rgb is not None:
-        for j, xyz in enumerate(points_3d):
-            track = torch_utils.colored_track_from_point(xyz, points_rgb[j])
-            gtsfm_data.add_track(track)
 
     if tracking_result:
         # track masks according to visibility, reprojection error, etc
@@ -541,33 +579,22 @@ def _convert_vggt_outputs_to_gtsfm_data(
             else:
                 rgb = np.zeros(3, dtype=np.uint8)
             point_xyz = tracking_result.points_3d[valid_id]
-            gtsam_point = Point3(float(point_xyz[0]), float(point_xyz[1]), float(point_xyz[2]))
             per_track_measurements: list[tuple[int, float, float]] = []
             frame_idx = np.where(track_mask[:, valid_id])[0]
             for local_id in frame_idx:
                 global_idx = image_indices[local_id]
                 u, v = tracking_result.tracks[local_id, valid_id]
+
+                # Add crop/pad offsets to the track
+                u = u + original_coords_np[local_id, 0]
+                v = v + original_coords_np[local_id, 1]
+
                 camera = gtsfm_data.get_camera(global_idx)
                 if not _is_point_in_front_of_camera(camera, point_xyz):
                     continue
                 per_track_measurements.append((global_idx, u, v))
 
             if len(per_track_measurements) < min_measurements:
-                continue
-
-            max_triangulation_angle = 0.0
-            for i in range(len(frame_idx)):
-                for j in range(i + 1, len(frame_idx)):
-                    global_idx_i = image_indices[frame_idx[i]]
-                    global_idx_j = image_indices[frame_idx[j]]
-                    camera_i = gtsfm_data.get_camera(global_idx_i)
-                    camera_j = gtsfm_data.get_camera(global_idx_j)
-                    triangulation_angle = mvs_utils.calculate_triangulation_angle_in_degrees(
-                        camera_i, camera_j, gtsam_point
-                    )
-                    max_triangulation_angle = max(max_triangulation_angle, triangulation_angle)
-
-            if max_triangulation_angle < config.min_triangulation_angle:
                 continue
 
             track = torch_utils.colored_track_from_point(point_xyz, rgb)
@@ -591,23 +618,37 @@ def _convert_vggt_outputs_to_gtsfm_data(
             logger.warning("Skipping bundle adjustment because VGGT produced no valid tracks.")
         else:
             try:
-                if config.max_reproj_error is not None and config.max_reproj_error > 0.0:
-                    gtsfm_data = gtsfm_data.filter_landmark_measurements(config.max_reproj_error)
+                if config.vggt_max_reproj_error is not None and config.vggt_max_reproj_error > 0.0:
+                    gtsfm_data = gtsfm_data.filter_landmark_measurements(
+                        config.vggt_max_reproj_error, config.min_track_length
+                    )
+                    cluster_prefix = f"[{cluster_label}] " if cluster_label else ""
                     logger.info(
-                        "🔍 #valid VGGT tracks after reproj error filtering: %d out of %d",
+                        "%s🔍 #valid VGGT tracks after reproj error filtering: %d out of %d",
+                        cluster_prefix,
                         gtsfm_data.number_tracks(),
                         gtsfm_data_pre_ba.number_tracks(),
                     )
-                gtsfm_data, should_run_ba = data_utils.remove_cameras_with_no_tracks(gtsfm_data, "node-level BA")
-                if not should_run_ba:
-                    return gtsfm_data, gtsfm_data_pre_ba
+                if config.drop_camera_with_no_track:
+                    gtsfm_data, should_run_ba = data_utils.remove_cameras_with_no_tracks(gtsfm_data, "node-level BA")
+                    if not should_run_ba:
+                        return gtsfm_data, gtsfm_data_pre_ba
                 optimizer = BundleAdjustmentOptimizer(
                     robust_ba_mode=RobustBAMode.GMC,
                     shared_calib=config.ba_use_shared_calibration,
                     use_calibration_prior=config.ba_use_calibration_prior,
+                    use_gnc=config.use_gnc,
+                    gnc_loss=config.gnc_loss,
+                    factor_weight_outlier_threshold=config.factor_weight_outlier_threshold,
                 )
-                gtsfm_data_with_ba, _ = optimizer.run_iterative_robust_ba(gtsfm_data, [0.8, 0.5, 0.2])
-                gtsfm_data_with_ba = gtsfm_data_with_ba.filter_landmark_measurements(3.0)
+                gtsfm_data_with_ba, _ = optimizer.run_simple_ba(gtsfm_data)
+                gtsfm_data_with_ba = gtsfm_data_with_ba.filter_landmark_measurements(config.post_ba_max_reproj_error)
+                logger.info(
+                    "%s🔍 #valid VGGT tracks after BA: %d out of %d",
+                    f"[{cluster_label}] " if cluster_label else "",
+                    gtsfm_data_with_ba.number_tracks(),
+                    gtsfm_data.number_tracks(),
+                )
                 return gtsfm_data_with_ba, gtsfm_data_pre_ba
             except Exception as exc:
                 logger.warning("⚠️ Failed to run bundle adjustment: %s", exc)
@@ -680,7 +721,7 @@ def run_VGGT(
         with autocast_ctx:
             batched = images.unsqueeze(0)  # make into (training) batch of 1
             tokens, ps_idx = model.aggregator(batched)  # transformer backbone
-        with torch.cuda.amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             pose_enc = model.camera_head(tokens)[-1]
             extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, batched.shape[-2:])
             depth_map, depth_conf = model.depth_head(tokens, batched, ps_idx)
@@ -753,6 +794,81 @@ def _import_vggsfm_utils():
     return _vggsfm_utils
 
 
+def generate_rank_by_dino(
+    images, query_frame_num, image_size=336, model_name="dinov2_vitb14_reg", device="cuda", spatial_similarity=False
+):
+    """
+    Generate a ranking of frames using DINO ViT features.
+
+    Args:
+        images: Tensor of shape (S, 3, H, W) with values in range [0, 1]
+        query_frame_num: Number of frames to select
+        image_size: Size to resize images to before processing
+        model_name: Name of the DINO model to use
+        device: Device to run the model on
+        spatial_similarity: Whether to use spatial token similarity or CLS token similarity
+
+    Returns:
+        List of frame indices ranked by their representativeness
+    """
+    vggsfm_utils = _import_vggsfm_utils()
+
+    # Resize images to the target size
+    images = F.interpolate(images, (image_size, image_size), mode="bilinear", align_corners=False)
+
+    # Load or reuse cached DINO model (per-worker cache, same pattern as VGGT in cluster_vggt)
+    device_str = str(device)
+    cache_key = (model_name, device_str)
+    if cache_key in _DINO_V2_MODEL_CACHE:
+        dino_v2_model = _DINO_V2_MODEL_CACHE[cache_key]
+    else:
+        logger.info("⏳ Loading DINOv2 model (%s)...", model_name)
+        dino_v2_model = torch.hub.load("facebookresearch/dinov2", model_name)
+        dino_v2_model.eval()
+        dino_v2_model = dino_v2_model.to(device)
+        _DINO_V2_MODEL_CACHE[cache_key] = dino_v2_model
+        logger.info("✅ DINOv2 model loaded successfully.")
+
+    # Normalize images using ResNet normalization
+    imagenet_mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    imagenet_std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    images_imagenet_norm = (images - imagenet_mean) / imagenet_std
+
+    with torch.no_grad():
+        frame_feat = dino_v2_model(images_imagenet_norm, is_training=True)
+
+    # Process features based on similarity type
+    if spatial_similarity:
+        frame_feat = frame_feat["x_norm_patchtokens"]
+        frame_feat_norm = F.normalize(frame_feat, p=2, dim=1)
+
+        # Compute the similarity matrix
+        frame_feat_norm = frame_feat_norm.permute(1, 0, 2)
+        similarity_matrix = torch.bmm(frame_feat_norm, frame_feat_norm.transpose(-1, -2))
+        similarity_matrix = similarity_matrix.mean(dim=0)
+    else:
+        frame_feat = frame_feat["x_norm_clstoken"]
+        frame_feat_norm = F.normalize(frame_feat, p=2, dim=1)
+        similarity_matrix = torch.mm(frame_feat_norm, frame_feat_norm.transpose(-1, -2))
+
+    distance_matrix = 100 - similarity_matrix.clone()
+
+    # Ignore self-pairing
+    similarity_matrix.fill_diagonal_(-100)
+    similarity_sum = similarity_matrix.sum(dim=1)
+
+    # Find the most common frame
+    most_common_frame_index = torch.argmax(similarity_sum).item()
+
+    # Conduct FPS sampling starting from the most common frame
+    fps_idx = vggsfm_utils.farthest_point_sampling(distance_matrix, query_frame_num, most_common_frame_index)
+
+    # Clean up intermediate tensors (model is cached for reuse)
+    del frame_feat, frame_feat_norm, similarity_matrix, distance_matrix
+
+    return fps_idx
+
+
 def _run_vggt_head_tracking(
     vggt_output: VggtOutput,
     *,
@@ -776,7 +892,7 @@ def _run_vggt_head_tracking(
         images = images.to(device=device, dtype=torch.float32, non_blocking=True)
 
     frame_num = images.shape[0]
-    query_frame_indexes = vggsfm_utils.generate_rank_by_dino(
+    query_frame_indexes = generate_rank_by_dino(
         images,
         query_frame_num=cfg.query_frame_num,
         image_size=518,
@@ -933,6 +1049,7 @@ def run_reconstruction(
     config: Optional[VggtConfiguration] = None,
     model: Optional[VGGT] = None,
     weights_path: PathLike | None = None,
+    cluster_label: Optional[str] = None,
 ) -> VggtReconstruction:
     """Run VGGT on a batch of images and convert outputs to ``GtsfmData``.
 
@@ -945,6 +1062,7 @@ def run_reconstruction(
         config: Optional :class:`VggtConfiguration`.
         model: Optional pre-loaded VGGT model. If ``None``, the model is loaded from ``weights_path``.
         weights_path: Optional path to VGGT checkpoint. Ignored if ``model`` is provided.
+        cluster_label: Optional cluster name (e.g. ``C_1``, ``C_2_1``) for log messages.
 
     Returns:
         :class:`VggtReconstruction` containing the reconstructed ``GtsfmData`` and point cloud.
@@ -984,6 +1102,7 @@ def run_reconstruction(
         points_3d=points_3d,
         points_rgb=points_rgb,
         tracking_result=tracking_result,
+        cluster_label=cluster_label,
     )
 
     if vggt_output.device.type == "cuda":

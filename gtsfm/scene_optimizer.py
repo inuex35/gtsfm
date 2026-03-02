@@ -11,6 +11,7 @@ from typing import Optional, TypeVar, cast
 import matplotlib
 from dask.delayed import delayed
 from dask.distributed import Client, Future, performance_report
+from omegaconf import OmegaConf
 
 import gtsfm.utils.logger as logger_utils
 from gtsfm import cluster_merging
@@ -109,6 +110,10 @@ class SceneOptimizer:
         output_worker: Optional[str] = None,
         plot_reprojection_histograms: bool = True,
         use_nonlinear_sim3_merging: bool = False,
+        merging_pre_ba_max_reproj_error: float = 14.0,
+        merging_pre_ba_min_track_length: int = 2,
+        merging_ba_use_calibration_prior: bool = False,
+        merging_use_gnc: bool = False,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
@@ -122,10 +127,19 @@ class SceneOptimizer:
         self._drop_outlier_after_camera_merging = getattr(
             self.cluster_optimizer, "drop_outlier_after_camera_merging", True
         )
+        self._post_ba_max_reproj_error = getattr(self.cluster_optimizer, "post_ba_max_reproj_error", 3.0)
         self._drop_camera_with_no_track = getattr(self.cluster_optimizer, "drop_camera_with_no_track", True)
         self._drop_child_if_merging_fail = getattr(self.cluster_optimizer, "drop_child_if_merging_fail", True)
         self._use_shared_calibration = getattr(self.cluster_optimizer, "use_shared_calibration", True)
+        self._gnc_loss = getattr(self.cluster_optimizer, "gnc_loss", "GMC")
         self._use_nonlinear_sim3_merging = use_nonlinear_sim3_merging
+        self._min_track_length = getattr(self.cluster_optimizer, "min_track_length", 2)
+        self._keep_all_cameras_in_merging = getattr(self.cluster_optimizer, "keep_all_cameras_in_merging", False)
+        self._merging_pre_ba_max_reproj_error = merging_pre_ba_max_reproj_error
+        self._merging_pre_ba_min_track_length = merging_pre_ba_min_track_length
+        self._merging_ba_use_calibration_prior = merging_ba_use_calibration_prior
+        self._merging_use_gnc = merging_use_gnc
+        self._config_snapshot = None
         self.output_root = Path(output_root)
         if output_worker is not None:
             self.cluster_optimizer._output_worker = output_worker
@@ -188,6 +202,11 @@ class SceneOptimizer:
         # Process Graph Generation: Visualize the process graph, which is a flow of data across GTSFM's modules.
         process_graph_generator = ProcessGraphGenerator()
         base_output_paths = prepare_output_paths(self.output_root, None)
+        config_snapshot = self._config_snapshot
+        if config_snapshot is not None:
+            config_path = base_output_paths.results / "config.yaml"
+            OmegaConf.save(config=config_snapshot, f=str(config_path))
+            logger.info("📦 Saved final config snapshot to %s", config_path)
         process_graph_generator.save_graph(str(base_output_paths.plots / "process_graph_output.svg"))
 
         logger.info("🔥 GTSFM: Running image pair retrieval...")
@@ -244,6 +263,7 @@ class SceneOptimizer:
                         cast(Optional[GtsfmData], reconstruction),
                         child_results,
                         cameras_gt=cameras_gt,
+                        post_ba_max_reproj_error=self._post_ba_max_reproj_error,
                         run_bundle_adjustment_on_parent=self._run_bundle_adjustment_on_parent,
                         plot_reprojection_histograms=self._plot_reprojection_histograms,
                         merge_duplicate_tracks=self._merge_duplicate_tracks,
@@ -253,6 +273,13 @@ class SceneOptimizer:
                         store_full_data=False,
                         use_nonlinear_sim3_alignment=self._use_nonlinear_sim3_merging,
                         use_shared_calibration=self._use_shared_calibration,
+                        use_gnc=self._merging_use_gnc,
+                        gnc_loss=self._gnc_loss,
+                        min_track_length=self._min_track_length,
+                        keep_all_cameras_in_merging=self._keep_all_cameras_in_merging,
+                        pre_ba_max_reproj_error=self._merging_pre_ba_max_reproj_error,
+                        pre_ba_min_track_length=self._merging_pre_ba_min_track_length,
+                        ba_use_calibration_prior=self._merging_ba_use_calibration_prior,
                     )
 
                 merged_future_tree = submit_tree_map_with_children(client, reconstruction_tree, merge_fn)

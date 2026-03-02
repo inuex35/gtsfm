@@ -54,6 +54,12 @@ class ClusterOptimizerCacher(ClusterOptimizerBase):
             drop_camera_with_no_track=getattr(optimizer, "drop_camera_with_no_track", True),
             plot_reprojection_histograms=getattr(optimizer, "plot_reprojection_histograms", True),
             use_shared_calibration=getattr(optimizer, "use_shared_calibration", True),
+            use_gnc=getattr(optimizer, "use_gnc", False),
+            gnc_loss=getattr(optimizer, "gnc_loss", "GMC"),
+            post_ba_max_reproj_error=getattr(optimizer, "post_ba_max_reproj_error", 3.0),
+            min_track_length=getattr(optimizer, "min_track_length", 2),
+            keep_all_cameras_in_merging=getattr(optimizer, "keep_all_cameras_in_merging", False),
+            merge_duplicate_tracks=getattr(optimizer, "merge_duplicate_tracks", True),
             output_worker=optimizer._output_worker,
         )
         self._optimizer = optimizer
@@ -95,6 +101,9 @@ class ClusterOptimizerCacher(ClusterOptimizerBase):
             pose_angular_error_thresh=self._optimizer.pose_angular_error_thresh,
             run_bundle_adjustment_on_leaf=run_bundle_adjustment_on_leaf,
             run_bundle_adjustment_on_parent=getattr(self._optimizer, "run_bundle_adjustment_on_parent", True),
+            use_gnc=getattr(self._optimizer, "use_gnc", False),
+            gnc_loss=getattr(self._optimizer, "gnc_loss", "GMC"),
+            keep_all_cameras_in_merging=getattr(self._optimizer, "keep_all_cameras_in_merging", False),
             output_worker=self._optimizer._output_worker,
         )
 
