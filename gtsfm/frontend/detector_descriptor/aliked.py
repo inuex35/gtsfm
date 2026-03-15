@@ -18,7 +18,7 @@ from gtsfm.common.image import Image
 from gtsfm.common.keypoints import Keypoints
 from gtsfm.frontend.detector_descriptor.detector_descriptor_base import DetectorDescriptorBase
 
-from thirdparty.LightGlue.lightglue.aliked import ALIKED
+from lightglue.aliked import ALIKED
 
 
 class AlikedDetectorDescriptor(DetectorDescriptorBase):

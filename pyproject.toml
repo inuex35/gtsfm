@@ -105,6 +105,9 @@ dependencies = [
     "visu3d==1.5.3",
     "etils==1.7.0",
     "nbformat==5.10.4",
+
+    # Feature matching
+    "lightglue @ git+https://github.com/cvg/LightGlue.git",
 ]
 
 # ============================================================================
@@ -185,6 +188,9 @@ explicit = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 # ============================================================================
 # UV Configuration

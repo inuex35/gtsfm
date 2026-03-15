@@ -34,7 +34,7 @@ class LightGlueMatcher(MatcherBase):
     def _ensure_model_loaded(self):
         """Lazy loading of the LightGlue model to avoid import warnings when using cache."""
         if self._model is None:
-            from thirdparty.LightGlue.lightglue.lightglue import LightGlue
+            from lightglue.lightglue import LightGlue
 
             logger = logger_utils.get_logger()
             logger.info("⏳ Loading LightGlue model weights...")
@@ -104,7 +104,7 @@ class LightGlueMatcher(MatcherBase):
             matches = self._model({"image0": feats_i1, "image1": feats_i2})
 
         # Import rbd when needed to avoid triggering warnings on import
-        from thirdparty.LightGlue.lightglue.utils import rbd
+        from lightglue.utils import rbd
 
         feats_i1, feats_i2, matches = [rbd(x) for x in [feats_i1, feats_i2, matches]]  # remove batch dimension
         matches = matches["matches"].detach().cpu().numpy()  # indices with shape (N, 2)
